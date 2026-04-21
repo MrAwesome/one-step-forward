@@ -25,6 +25,8 @@ By default, steps will ask for confirmation, unless you enable "Automatic accept
 There are several other options available in the in-game Game Options menu under "[One Step Forward]".
 
 Heavily inspired by the auto-attack system in Path of Achra (which was in turn heavily inspired by ToME).
+
+''Please note: The author is a software engineer, but as an experiment this was '''heavily''' vibe-coded so do not be surprised if your game explodes.''
 ]]
 tags = { "movement", "quality of life", "autoexplore" }
 
