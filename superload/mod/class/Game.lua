@@ -10,6 +10,7 @@ function _M:loaded()
 		-- that change come back clean (a stale uid could otherwise resolve to a
 		-- different actor via __uids on this load).
 		OSF.clear_melee_focus(self.player)
+		OSF.clear_sticky_target(self.player)
 		OSF.grant_talent_if_missing(self.player)
 	end
 end

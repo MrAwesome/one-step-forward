@@ -7,10 +7,10 @@ local Map = require "engine.Map"
 
 local M = {}
 
---- Hard-coded fallback defaults. The live values read from
---- config.settings.tome.one_step_forward (populated by mod/settings.lua and the
---- in-game options page added by hooks/load.lua); these are only used when the
---- settings table is missing (e.g. very early load, or a user wiping config).
+--- Single source of truth for defaults. hooks/load.lua requires this module to seed
+--- config.settings.tome.one_step_forward on first launch and to drive save-serialization.
+--- M.opt() falls back to this table when a settings key is missing (e.g. very early load,
+--- or a user wiping config), so the primitives below always see a populated value.
 M.defaults = {
 	--- How to pick the hostile used for approach movement when several are visible.
 	--- "closest"      — minimum grid distance (same notion as core.fov.distance).
@@ -40,7 +40,7 @@ M.defaults = {
 	--- would step to (or the hostile it would bump); a second press on the same turn
 	--- commits. Any other action (which consumes a turn) silently drops the pending
 	--- highlight, so the next press recomputes and highlights afresh.
-	confirm_before_stepping = false,
+	confirm_before_stepping = true,
 }
 
 --- Live settings view. Reads config.settings.tome.one_step_forward and falls
@@ -228,6 +228,19 @@ local function standing_goals_adjacent(actor, tx, ty)
 	return goals
 end
 
+--- First step on a shortest A* path (engine.Astar, same rules as AI / escort pathing)
+--- to (tx, ty) itself. Returns nil if no walkable route or already on the tile.
+--- @return number|nil, number|nil
+function M.astar_first_step_to_tile(actor, tx, ty)
+	if actor.x == tx and actor.y == ty then return nil, nil end
+	local forbid_diag = actor:attr("forbid_diagonals")
+	local ast = Astar.new(game.level.map, actor)
+	local add_check = function(x, y) return actor:canMove(x, y) end
+	local path = ast:calc(actor.x, actor.y, tx, ty, nil, nil, add_check, forbid_diag)
+	if not path or #path < 1 then return nil, nil end
+	return path[1].x, path[1].y
+end
+
 --- First step on a shortest A* path (engine.Astar, same rules as AI / escort pathing) toward any goal.
 --- @param primary Actor|nil optional priority foe for tie-breaking when opts.avoid_weaker is set
 --- @param opts { avoid_weaker: boolean }
@@ -344,22 +357,98 @@ local function pick_bump_target(actor, primary, cfg)
 	return bump_actor
 end
 
+--- Sticky approach target. Once the player confirms a specific foe via the confirm-before-stepping
+--- targeting UI, subsequent OSF presses keep stepping toward that foe even if the normal pick-mode
+--- would have picked a different one — so "pick the farthest skeleton, commit" sticks to it over
+--- several presses. Stored as a uid (resolved via engine __uids) so we don't keep a live actor ref
+--- that would survive serialization; also excluded from _no_save_fields for exactly that reason.
+function M.set_sticky_target(actor, target)
+	if not actor or not target or target.dead or not actor.player then return end
+	if actor:reactionToward(target) >= 0 then return end
+	actor.osf_sticky_target_uid = target.uid
+end
+
+function M.clear_sticky_target(actor)
+	if actor then actor.osf_sticky_target_uid = nil end
+end
+
+local function get_sticky_target(actor)
+	if not actor or not actor.osf_sticky_target_uid or not game.level then return nil end
+	local t = __uids[actor.osf_sticky_target_uid]
+	if not t or t.dead or not game.level:hasEntity(t) then
+		M.clear_sticky_target(actor)
+		return nil
+	end
+	if actor:reactionToward(t) >= 0 then
+		M.clear_sticky_target(actor)
+		return nil
+	end
+	if not actor:canSee(t) then
+		-- Not currently visible: drop the sticky and fall back to auto-pick. If the player wanted to
+		-- keep hunting an out-of-sight foe they'd re-select it once it's visible again anyway.
+		M.clear_sticky_target(actor)
+		return nil
+	end
+	return t
+end
+
+--- Decide whether the auto-pick should displace a sticky target under the current enemy_pick_mode.
+--- Rule: the sticky is a manual override the player made. We only take it back when the mode's own
+--- definition of "priority" is *structurally* violated by the sticky.
+---   * "highest_rank" — sticky yields if a higher-rank foe is visible. This is the user's main use
+---                      case ("a more powerful enemy appearing when we have rank targeting").
+---   * "closest"      — sticky never yields automatically. The player explicitly picked a non-closest
+---                      foe; dropping it the moment something closer exists would make sticky useless
+---                      in closest mode. It will still clear on death / loss-of-sight / re-selection.
+local function challenger_beats_incumbent(actor, incumbent, challenger, cfg)
+	if challenger == incumbent then return false end
+	local mode = M.opt(cfg, "enemy_pick_mode")
+	if mode == "highest_rank" then
+		local ri, rc = incumbent.rank or 2, challenger.rank or 2
+		return rc > ri
+	end
+	return false
+end
+
+--- Which hostile the approach logic should treat as the primary this press:
+--- sticky target if still valid and not obviously dominated by the current auto-pick, else auto-pick.
+--- Returns an Actor or nil.
+local function resolve_approach_target(actor, cfg)
+	local auto_entry = pick_hostile(actor, cfg)
+	local auto_pick = auto_entry and auto_entry.actor or nil
+
+	local sticky = get_sticky_target(actor)
+	if sticky then
+		-- Honor sticky unless the current pick_mode's priority rule is structurally violated by it
+		-- (see challenger_beats_incumbent for the exact rule per mode).
+		if auto_pick and challenger_beats_incumbent(actor, sticky, auto_pick, cfg) then
+			M.clear_sticky_target(actor)
+			return auto_pick
+		end
+		return sticky
+	end
+
+	return auto_pick
+end
+
 --- Pure computation: where would unconditional_step go right now?
---- Returns { kind = "bump", x, y, bump_actor } for a bump (hostile at (x,y)),
----         { kind = "move", x, y } for a standard step,
---- or nil if there is nowhere to step.
---- Does not mutate game state (autoexplore_next_tile already guarantees that).
+--- Returns:
+---   { kind = "bump", x, y, bump_actor, primary }   — adjacent foe, bump them (primary == hostile we are approaching, bump_actor == tile we bump which may differ on cramped encounters)
+---   { kind = "move", x, y, primary }               — one step along the A* path to primary
+---   { kind = "move", x, y }                        — no visible hostiles, auto-explore tile
+--- or nil if there is nowhere to step. Does not mutate game state.
+--- `primary` is the hostile this plan is built around, exposed so callers can seed a targeting cursor
+--- on the foe (not the step tile) and so the sticky-target bookkeeping can compare against it.
 function M.compute_next_step(actor, cfg)
 	cfg = cfg or {}
 	if not game.level or not actor.x or not actor.y then return nil end
 
-	local foe = pick_hostile(actor, cfg)
-	if foe then
-		local primary = foe.actor
+	local primary = resolve_approach_target(actor, cfg)
+	if primary then
 		local tx, ty = primary.x, primary.y
 		if cells_are_adjacent(actor.x, actor.y, tx, ty) then
 			local bump = pick_bump_target(actor, primary, cfg)
-			return { kind = "bump", x = bump.x, y = bump.y, bump_actor = bump }
+			return { kind = "bump", x = bump.x, y = bump.y, bump_actor = bump, primary = primary }
 		end
 
 		local pick_mode = M.opt(cfg, "enemy_pick_mode")
@@ -367,11 +456,11 @@ function M.compute_next_step(actor, cfg)
 		local avoid = maw and (pick_mode == "highest_rank")
 
 		local nx, ny = M.astar_first_step_to_adjacent(actor, tx, ty, primary, { avoid_weaker = avoid })
-		if nx and ny then return { kind = "move", x = nx, y = ny } end
+		if nx and ny then return { kind = "move", x = nx, y = ny, primary = primary } end
 
 		if avoid then
 			local dx, dy = trivial_diagonal_closer(actor, primary)
-			if dx then return { kind = "move", x = dx, y = dy } end
+			if dx then return { kind = "move", x = dx, y = dy, primary = primary } end
 		end
 
 		-- attackOrMoveDir fallback: step toward (tx,ty) even if no pathable route — the engine
@@ -379,7 +468,7 @@ function M.compute_next_step(actor, cfg)
 		local dir = util.getDir(tx, ty, actor.x, actor.y)
 		if dir then
 			local sx, sy = util.coordAddDir(actor.x, actor.y, dir)
-			if sx and sy then return { kind = "move", x = sx, y = sy } end
+			if sx and sy then return { kind = "move", x = sx, y = sy, primary = primary } end
 		end
 		return nil
 	end
@@ -390,9 +479,14 @@ function M.compute_next_step(actor, cfg)
 end
 
 --- Execute a previously-computed step. Must be called in the same logical game state the plan was
---- computed in (same turn, same positions). The caller is expected to re-validate freshness before use.
+--- computed in (same turn, same positions). Revalidates the bump target: auto-accept path skips
+--- the targeting UI (which would have caught a mid-plan death) so we have to check here.
 local function apply_step_plan(actor, plan)
 	if plan.kind == "bump" and plan.bump_actor then
+		if plan.bump_actor.dead then
+			game.logPlayer(actor, "Target is gone.")
+			return false, "handled"
+		end
 		actor:bumpInto(plan.bump_actor, plan.bump_actor.x, plan.bump_actor.y)
 		return true
 	end
@@ -601,41 +695,65 @@ end
 --- directly: seed target.{x, y, entity} from the plan, enter "exclusive" keygrab mode, yield. The
 --- engine's own targetmode_key bindings (Enter/Space = ACCEPT, Esc = EXIT, cursor moves, mouse)
 --- resume our coroutine with either (x, y, entity) on confirm or (nil, nil, nil) on cancel.
---- @return number|nil, number|nil  confirmed (x, y), or nil, nil on cancel
+---
+--- target_style governs directional-key behavior in the engine's MOVE_* bindings:
+---   * "lock" — arrows scan between visible actors matching the scan filter (enemies). Matches how
+---              Rush / Shoot / any ranged targeted talent feel: arrows cycle between foes.
+---   * "free" — arrows free-move the cursor one tile. Used when no enemies are visible, so arrows
+---              still do something useful (manual aim).
+--- We pick a mode based on whether any hostiles are visible right now, and widen typ.range beyond 1
+--- in lock mode so the cursor can reach a non-adjacent enemy the player scans to. Post-confirm logic
+--- in unconditional_step handles the two confirmable tile classes: adjacent walkable/bump-able tiles
+--- (directed step), and visible hostiles at any range (treated as "approach this enemy" via the
+--- normal OSF hostile path).
+--- @return number|nil, number|nil, table|nil  confirmed (x, y, entity) or nil on cancel
 local function confirm_plan_via_targeting(actor, plan)
-	if not game.target then return plan.x, plan.y end  -- fallback: commit without prompt if no UI
+	if not game.target then return plan.x, plan.y end
 	local co = coroutine.running()
-	if not co then return plan.x, plan.y end  -- talent action always runs in a coroutine; guard for safety
+	if not co then return plan.x, plan.y end
 
-	-- Seed the cursor on the plan tile. For bumps, use the hostile so the engine shows its tooltip
-	-- naturally; for plain moves, point target.entity at whatever already occupies the tile (usually
-	-- nothing, occasionally a friendly / item).
-	local entity = (plan.kind == "bump" and plan.bump_actor) or game.level.map(plan.x, plan.y, Map.ACTOR)
+	local has_hostiles = #M.visible_hostiles(actor) > 0
+
+	-- Seed the cursor on the priority foe when we have one, not on the step tile. That way arrow-keys
+	-- (scan mode) start by locking onto the enemy we would be approaching and cycle from there, and
+	-- confirming without touching the keys approaches the same foe the plan picked. When there is no
+	-- primary (auto-explore plan), fall back to the step tile itself.
+	local cursor_x, cursor_y, entity
+	if plan.primary and not plan.primary.dead then
+		cursor_x, cursor_y = plan.primary.x, plan.primary.y
+		entity = plan.primary
+	else
+		cursor_x, cursor_y = plan.x, plan.y
+		entity = (plan.kind == "bump" and plan.bump_actor) or game.level.map(plan.x, plan.y, Map.ACTOR)
+	end
 	game.target.target.entity = entity
-	game.target.target.x = plan.x
-	game.target.target.y = plan.y
+	game.target.target.x = cursor_x
+	game.target.target.y = cursor_y
 
-	-- "hit" type fills display_default_target + block_path etc. so Target:realDisplay has something to
-	-- draw. range=1 constrains the cursor, nowarning skips "target yourself?" (irrelevant for a step),
-	-- no_restrict skips canProject (we are not projecting a spell, we are previewing a step).
+	-- In lock mode we let the scan reach any visible enemy (default scan radius is 20). In free mode
+	-- range=1 is enough because the cursor only ever freemoves one tile at a time. We still ask for
+	-- type="hit" so Target:realDisplay has display_default_target / block_path populated.
 	local typ = {
 		type = "hit",
-		range = 1,
+		range = has_hostiles and (actor.sight or 20) or 1,
 		nowarning = true,
 		no_restrict = true,
 		source_actor = actor,
 		start_x = actor.x, start_y = actor.y,
-		no_start_scan = true,          -- don't let the engine snap the cursor to a nearby enemy
+		no_start_scan = true,
 		no_move_tooltip = true,
+		-- Only cycle hostiles when scanning; friendlies / items should be skipped by MOVE_* keys.
+		custom_scan_filter = function(a) return a ~= actor and actor:reactionToward(a) < 0 end,
 		talent = { name = "One Step Forward" },
 	}
 
-	-- targetMode("exclusive", msg, co, typ) stashes co in game.target_co, swaps key handlers, and
-	-- returns immediately. coroutine.yield() parks the talent's action; when the player hits
-	-- ACCEPT/EXIT/clicks/etc., GameTargeting:targetMode(false, ...) resumes co with the result.
 	game:targetMode("exclusive", false, co, typ)
-	local tx, ty = coroutine.yield()
-	return tx, ty
+	-- targetMode unconditionally resets target_style to "lock" (GameTargeting.lua:151). Override
+	-- AFTER the call so our choice sticks until the player accepts/cancels.
+	game.target_style = has_hostiles and "lock" or "free"
+
+	local tx, ty, ent = coroutine.yield()
+	return tx, ty, ent
 end
 
 --- One unconditional step: hostile approach if any visible hostiles, else auto-explore tile.
@@ -647,14 +765,18 @@ end
 ---   confirm_before_stepping = boolean,
 --- }
 --- Any unset key reads from config.settings.tome.one_step_forward, then M.defaults.
---- @return boolean true if a move, bump-attack, or highlight was made (i.e. the press did something)
+--- @return boolean, string|nil
+---   first  — true if a move/bump/highlight happened (the press did something visible)
+---   second — "handled" if the press was consumed with its own user-visible feedback (e.g. ammo
+---            block logged its own red message, or the confirm prompt was canceled). Callers
+---            should NOT emit a generic "nowhere to step" message in that case.
 function M.unconditional_step(actor, cfg)
 	cfg = cfg or {}
 	if not game.level or not actor.x or not actor.y then return false end
 
 	if M.opt(cfg, "block_step_on_empty_ammo") and should_block_for_empty_ammo(actor) then
 		game.logPlayer(actor, "#LIGHT_RED#Out of ammo: not stepping.#LAST#")
-		return false
+		return false, "handled"
 	end
 
 	local confirm_mode = M.opt(cfg, "confirm_before_stepping") and actor.player
@@ -680,27 +802,55 @@ function M.unconditional_step(actor, cfg)
 	if not plan then return false end
 
 	if config and config.settings and config.settings.auto_accept_target then
+		if plan.primary then M.set_sticky_target(actor, plan.primary) end
 		return apply_step_plan(actor, plan)
 	end
 
-	local tx, ty = confirm_plan_via_targeting(actor, plan)
-	if not tx or not ty then return false end  -- Esc / right-click cancel
+	local tx, ty, ent = confirm_plan_via_targeting(actor, plan)
+	if not tx or not ty then return false, "handled" end  -- Esc / right-click cancel: user already saw cursor vanish
 
-	-- Player accepted the plan tile as-is: commit via apply_step_plan so bumps go through the
-	-- canonical bumpInto path (hex-safe, picks up melee focus / adjacent tiebreak rules).
-	if tx == plan.x and ty == plan.y then
-		if plan.kind == "bump" and plan.bump_actor and plan.bump_actor.dead then
-			game.logPlayer(actor, "Target is gone.")
-			return false
+	-- If the confirmed tile has a visible hostile on it (either because the player scanned to a foe
+	-- or the plan's primary was already seeded there), treat it as "approach this foe". Set sticky
+	-- so subsequent OSF presses keep targeting this enemy until it dies, leaves sight, the player
+	-- picks another, or a higher-priority foe appears under the current pick rule.
+	local chosen_foe = ent or game.level.map(tx, ty, Map.ACTOR)
+	if chosen_foe and not chosen_foe.dead and actor:reactionToward(chosen_foe) < 0 and actor:canSee(chosen_foe) then
+		M.set_sticky_target(actor, chosen_foe)
+		-- If this is the same primary the plan was built against, reuse the plan so bumps honor melee
+		-- focus and adjacent-tiebreak. Otherwise rebuild via step_toward_hostile (full A* / avoid /
+		-- trivial-diagonal / direct-bump cascade against the newly chosen foe).
+		if plan.primary == chosen_foe then
+			return apply_step_plan(actor, plan)
 		end
+		return step_toward_hostile(actor, { actor = chosen_foe, x = chosen_foe.x, y = chosen_foe.y,
+			dist = core.fov.distance(actor.x, actor.y, chosen_foe.x, chosen_foe.y) }, cfg)
+	end
+
+	-- No foe at the confirmed tile. Accept-as-is if it matches the plan's step tile (covers the
+	-- auto-explore / bump-onto-empty-door case when the cursor never moved).
+	if tx == plan.x and ty == plan.y then
 		return apply_step_plan(actor, plan)
 	end
 
-	-- Player moved the cursor to a different tile before confirming. Treat as a directed step: must
-	-- still be an adjacent walkable/bump-able neighbor (we gave the cursor range=1, but be defensive).
+	-- Self-target: the player accepted their own tile. Treat as a deliberate "stand still"
+	-- confirmation — no movement, no log spam, but still consume the press as handled so the
+	-- caller doesn't emit a generic "nowhere to step" message.
+	if tx == actor.x and ty == actor.y then
+		return false, "handled"
+	end
+
+	-- Non-adjacent non-foe tile: take one step along the A* path toward it. This lets the player
+	-- point at a distant floor tile (e.g. to rotate around an obstacle or walk a corridor) and
+	-- have the talent step one tile in that direction, matching the "one step forward" spirit.
+	-- If there is no walkable route at all, give up quietly (no feedback needed — the cursor
+	-- already showed the player what they picked).
 	if not cells_are_adjacent(actor.x, actor.y, tx, ty) then
-		game.logPlayer(actor, "That tile is not adjacent.")
-		return false
+		local sx, sy = M.astar_first_step_to_tile(actor, tx, ty)
+		if sx and sy then
+			step_to(actor, sx, sy)
+			return true
+		end
+		return false, "handled"
 	end
 	local victim = game.level.map(tx, ty, Map.ACTOR)
 	if victim and actor:reactionToward(victim) < 0 then

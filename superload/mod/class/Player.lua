@@ -7,8 +7,12 @@ local _M = loadPrevious(...)
 --                          uid that now belongs to a different actor.
 --   __osf_attack_depth   — non-nil only mid-useTalent; saves cannot happen while
 --                          that coroutine is running, but we exclude defensively.
+--   osf_sticky_target_uid — confirm-mode "remembered approach target" uid (resolved via __uids).
+--                          Treated the same as the melee-focus uid: transient session state;
+--                          saving it risks resolving to a different actor after reload.
 _M._no_save_fields = table.clone(_M._no_save_fields or {}, true)
 _M._no_save_fields.osf_melee_focus_uid = true
+_M._no_save_fields.osf_sticky_target_uid = true
 _M._no_save_fields.__osf_attack_depth = true
 
 local base_onBirth = _M.onBirth

@@ -46,10 +46,13 @@ newTalent{
 	end,
 	action = function(self, t)
 		local OSF = require "data-one_step_forward.api"
-		if OSF.unconditional_step(self) then
-			return true
+		local ok, reason = OSF.unconditional_step(self)
+		if ok then return true end
+		-- "handled" = api emitted its own user-visible feedback (ammo block, cancel, etc.).
+		-- Don't stack a generic message on top.
+		if reason ~= "handled" then
+			game.logPlayer(self, "There is nowhere to step.")
 		end
-		game.logPlayer(self, "There is nowhere to step.")
 		return false
 	end,
 	info = function(self, t)

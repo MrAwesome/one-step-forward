@@ -19,13 +19,10 @@ local Textzone = require "engine.ui.Textzone"
 -- Storage key: config.settings.tome.one_step_forward.{...}.
 -- Saved in a single tome.one_step_forward serialized blob via saveSettings,
 -- mirroring how ToME persists tome.fonts / tome.gfx (one nested table per call).
-local OSF_DEFAULTS = {
-	enemy_pick_mode = "closest",
-	adjacent_enemy_pick_mode = "lowest_hp_remaining_absolute",
-	move_around_weaker = false,
-	block_step_on_empty_ammo = false,
-	confirm_before_stepping = false,
-}
+-- Defaults live in data/api.lua (M.defaults) — single source of truth.
+local function osf_defaults()
+	return require("data-one_step_forward.api").defaults
+end
 
 local function ensure_settings()
 	config.settings.tome = config.settings.tome or {}
@@ -34,25 +31,35 @@ local function ensure_settings()
 		s = {}
 		config.settings.tome.one_step_forward = s
 	end
-	for k, v in pairs(OSF_DEFAULTS) do
+	for k, v in pairs(osf_defaults()) do
 		if s[k] == nil then s[k] = v end
 	end
 	return s
 end
 
 -- Serialize the whole nested table on every change (same approach as tome.fonts).
--- Strings are %q-quoted; booleans/nil pass through tostring. Keep this tight:
--- only the three keys we own, so an upgrade that adds a key never silently
--- writes a stale subset.
+-- Iterate api.defaults so adding a setting there auto-extends persistence. Stable key
+-- order (sorted) keeps the resulting config file diff-friendly.
 local function save_settings()
 	local s = ensure_settings()
-	local body = ("tome.one_step_forward = { enemy_pick_mode = %q, adjacent_enemy_pick_mode = %q, move_around_weaker = %s, block_step_on_empty_ammo = %s, confirm_before_stepping = %s }\n"):format(
-		tostring(s.enemy_pick_mode),
-		tostring(s.adjacent_enemy_pick_mode),
-		tostring(s.move_around_weaker and true or false),
-		tostring(s.block_step_on_empty_ammo and true or false),
-		tostring(s.confirm_before_stepping and true or false)
-	)
+	local defaults = osf_defaults()
+	local keys = {}
+	for k in pairs(defaults) do keys[#keys + 1] = k end
+	table.sort(keys)
+	local parts = {}
+	for _, k in ipairs(keys) do
+		local v = s[k]
+		local enc
+		if type(v) == "boolean" then
+			enc = tostring(v)
+		elseif type(v) == "number" then
+			enc = tostring(v)
+		else
+			enc = ("%q"):format(tostring(v))
+		end
+		parts[#parts + 1] = ("%s = %s"):format(k, enc)
+	end
+	local body = ("tome.one_step_forward = { %s }\n"):format(table.concat(parts, ", "))
 	game:saveSettings("tome.one_step_forward", body)
 end
 
@@ -162,11 +169,13 @@ class:bindHook("GameOptions:generateList", function(self, data)
 		"block_step_on_empty_ammo")
 
 	add_bool(
-		"Confirm before stepping (targetable)",
-		"When enabled, pressing the talent opens the standard targeting cursor on the tile it would step to (or the hostile it would bump) instead of moving immediately.\n\n"..
+		"Confirm before stepping",
+		"When enabled, pressing the talent opens the standard targeting cursor instead of moving immediately.\n\n"..
 		"* #YELLOW#Enter#LAST# / #YELLOW#Space#LAST# / left-click: commit.\n"..
 		"* #YELLOW#Esc#LAST# / right-click: cancel without spending a turn.\n"..
-		"* Move the cursor to a different #YELLOW#adjacent#LAST# tile before confirming to redirect the step or bump.\n\n"..
-		"Respects ToME's #YELLOW#Automatically accept target#LAST# option: with that enabled the first press commits immediately with no prompt, exactly like other targeted talents (Rush, Shoot, etc.).",
+		"* With visible hostiles, the cursor locks onto the foe One Step Forward would approach, and arrows #YELLOW#scan#LAST# between enemies — same as Rush, Shoot, etc. Confirming on any foe walks one step toward it or bump-attacks if adjacent.\n"..
+		"* With no visible hostiles, arrows #YELLOW#free-move#LAST# the cursor one tile — confirm on any adjacent tile to redirect the step or bump.\n\n"..
+		"#YELLOW#Sticky target#LAST#: once you confirm a specific foe, the talent keeps stepping toward that enemy on subsequent presses until it dies, leaves sight, or you pick another. Under #YELLOW#Highest rank#LAST# priority the sticky also yields automatically if a higher-rank foe appears; under #YELLOW#Closest#LAST# priority the sticky only changes when you manually select a new one.\n\n"..
+		"Respects ToME's #YELLOW#Automatically accept target#LAST# option: with that enabled the first press commits immediately with no prompt, and the plan's priority foe becomes the sticky.",
 		"confirm_before_stepping")
 end)
