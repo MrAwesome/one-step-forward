@@ -34,7 +34,7 @@ M.defaults = {
 	--- the Throwing Knives talent learned) and every such source is empty. Stops you
 	--- from auto-bumping into melee when you really wanted to reload, swap weapons, or
 	--- back off. Pure melee characters are never blocked.
-	block_step_on_empty_ammo = false,
+	block_step_on_empty_ammo = true,
 
 	--- When true, the first press of the talent only *highlights* the tile the talent
 	--- would step to (or the hostile it would bump); a second press on the same turn
@@ -102,6 +102,15 @@ function M.visible_hostiles(actor)
 		}
 	end
 	return out
+end
+
+--- Same notion of "visible hostile" as Player:spotHostiles (FOV + explored tile + canSee).
+--- Actor:canSee alone ignores LOS, so teleported/ESP edge cases must not satisfy this.
+local function hostile_is_spot_visible(actor, target)
+	for _, e in ipairs(M.visible_hostiles(actor)) do
+		if e.actor == target then return true end
+	end
+	return false
 end
 
 --- Visible hostiles strictly weaker than primary (by rank), excluding primary.
@@ -383,9 +392,9 @@ local function get_sticky_target(actor)
 		M.clear_sticky_target(actor)
 		return nil
 	end
-	if not actor:canSee(t) then
-		-- Not currently visible: drop the sticky and fall back to auto-pick. If the player wanted to
-		-- keep hunting an out-of-sight foe they'd re-select it once it's visible again anyway.
+	if not hostile_is_spot_visible(actor, t) then
+		-- Not in LOS / not on a seen tile (same rules as spotHostiles). canSee() is insufficient — it
+		-- ignores geometry, so a foe who teleported away could still "pass" until we clear here.
 		M.clear_sticky_target(actor)
 		return nil
 	end
@@ -814,7 +823,7 @@ function M.unconditional_step(actor, cfg)
 	-- so subsequent OSF presses keep targeting this enemy until it dies, leaves sight, the player
 	-- picks another, or a higher-priority foe appears under the current pick rule.
 	local chosen_foe = ent or game.level.map(tx, ty, Map.ACTOR)
-	if chosen_foe and not chosen_foe.dead and actor:reactionToward(chosen_foe) < 0 and actor:canSee(chosen_foe) then
+	if chosen_foe and not chosen_foe.dead and actor:reactionToward(chosen_foe) < 0 and hostile_is_spot_visible(actor, chosen_foe) then
 		M.set_sticky_target(actor, chosen_foe)
 		-- If this is the same primary the plan was built against, reuse the plan so bumps honor melee
 		-- focus and adjacent-tiebreak. Otherwise rebuild via step_toward_hostile (full A* / avoid /
