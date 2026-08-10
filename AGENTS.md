@@ -12,9 +12,13 @@ Contains unpacked source of many existing ToME addons (Nekarcos QoL suite, ZOmni
 - Hook registration and event handling
 - `init.lua` metadata format and `load.lua` structure
 
+## DLCs
+
+The extracted code of the DLCs is in `~/code/addon-testing/tome-dlcs/`. This can be useful for checking the implementation of DLC-only talents/tinkers, such as Saw Wheels or Rocket Boots.
+
 ## Engine and game source
 
-Path: `~/code/t-engine4` (absolute: `/home/glenn/code/t-engine4`)
+Path: `~/code/t-engine4`
 
 Full T-Engine 4 + ToME source tree. Layout:
 - `game/engines/default/` — base engine Lua
