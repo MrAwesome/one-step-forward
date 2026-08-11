@@ -11,6 +11,8 @@ When already next to your target and more than one hostile is adjacent, the bump
 
 Costs no energy, no cooldown, can't be used by NPCs.
 
+The talent's own use is routed through the engine's forced-talent path, so a plain OSF step counts as *movement* and does not break sustained effects that end on "attacking or using any talent" (Saw Wheels, Rocket Boots) — nor stealth, reloading, or Step Up. A bump-attack resulting from OSF is a real Attack and breaks those effects normally, just like any bump.
+
 ## Configuration
 
 In-game: **Game Options → [One Step Forward]** tab.
